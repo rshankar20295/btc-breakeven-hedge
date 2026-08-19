@@ -1,0 +1,14 @@
+# Environment / secrets
+.env
+
+# State file (local runtime data, not source code)
+state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
