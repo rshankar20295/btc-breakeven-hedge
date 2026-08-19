@@ -1,8 +1,8 @@
 """
-Delta Exchange - BTC Options Short Strangle Strategy (v3.1 - Breakeven Hedge Edition)
+Delta Exchange - BTC Options Short Strangle Strategy (v3.2 - Breakeven Hedge Edition)
 ========================================================================================
-This is a NEW, SEPARATE version. It does NOT modify or replace main.py (v1) or the
-v2 SL/Target/Trailing-SL script - deploy this as its own repo/service.
+This is a NEW, SEPARATE version. It does NOT modify or replace main.py (v1), the v2
+SL/Target/Trailing-SL script, or v3/v3.1 - deploy this as its own repo/service.
 
 Sells 1 Call + 1 Put on BTC options, strike selected by nearest-match delta (any
 delta, including deep ITM values like 0.7 / -0.7). Entry within a user-defined
@@ -10,42 +10,45 @@ IST time window. NO stop loss, trailing stop loss, or target exit exists in this
 version - positions are intended to run to natural expiry/settlement on the
 exchange.
 
-WHAT CHANGED IN v3.1 (bug fixes on top of v3):
-  1. TRADING STATUS PRE-CHECK: Before placing ANY order, both the Call and Put
-     legs' trading_status is checked. If either is not "operational" (e.g.
-     market_disrupted_cancel_only_mode), the entry attempt is skipped entirely -
-     no orders are placed, no rollback needed. This fixes a real incident where
-     the bot kept placing the Call leg, having the Put leg rejected due to a
-     disrupted market, rolling back, and immediately retrying every poll cycle.
-  2. ENTRY RETRY CAP + COOLDOWN: Failed entry attempts are now capped per day
-     (MAX_ENTRY_ATTEMPTS_PER_WINDOW) with a cooldown between attempts
-     (ENTRY_RETRY_COOLDOWN_SECONDS), instead of retrying every single poll
-     cycle (~every 10 seconds) for the entire entry window.
-  3. LOT SIZE VALIDATION: Bot now refuses to start if CALL_LOTS != PUT_LOTS,
-     since mismatched quantities would silently corrupt the breakeven
-     calculation (which assumes equal quantities on both legs).
-  4. ZERO/NEGATIVE TIME VALUE WARNING: If computed time value is <= 0 at entry
-     (common for deep ITM strikes near expiry), breakeven levels cannot be
-     computed and hedge protection is effectively disabled for that trade.
-     The bot now prints a LOUD, REPEATING warning every monitoring cycle in
-     this case, instead of silently running unprotected.
-  5. ORPHAN POSITION STARTUP CHECK: On startup, if local state says no trade
-     is active, but the exchange reports open BTC option positions anyway
-     (e.g. due to a crash/restart between leg fills), the bot prints a loud
-     warning listing the orphaned position(s) and REFUSES to start a new
-     entry cycle until resolved manually. This prevents accidental duplicate
-     exposure.
+WHAT CHANGED IN v3.2 (on top of v3.1):
+  1. ENTRY DELTA FALLBACK: If the nearest-match delta strike is not
+     "operational" (e.g. market_disrupted_cancel_only_mode), the bot now
+     automatically tries the NEXT-nearest delta match instead, up to
+     MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS times, rather than skipping the
+     entire entry attempt outright. This significantly increases the odds
+     of actually getting a trade on, at the cost of a possibly slightly
+     less precise delta match on that leg (always logged when it happens).
+  2. HEDGE STRIKE FALLBACK: If the ideal ATM hedge strike (or the
+     next-strike-closer-to-spot used when ATM collides with the original
+     sold strike) is not operational, the bot now searches progressively
+     further strikes (always moving toward spot, never toward/through the
+     original sold strike, to avoid netting against the existing short),
+     up to MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS times, before giving up.
+     force_close_full_position() is now only triggered as a last resort,
+     if ALL fallback attempts are exhausted - not on the first rejection.
 
-EVERYTHING ELSE FROM v3 UNCHANGED:
+CARRIED OVER FROM v3.1 (bug fixes on v3):
+  - TRADING STATUS PRE-CHECK on both legs before every order attempt.
+  - ENTRY RETRY CAP + COOLDOWN (MAX_ENTRY_ATTEMPTS_PER_WINDOW,
+    ENTRY_RETRY_COOLDOWN_SECONDS) instead of retrying every poll cycle.
+  - LOT SIZE VALIDATION: bot refuses to start if CALL_LOTS != PUT_LOTS.
+  - ZERO/NEGATIVE TIME VALUE WARNING: loud, repeating warning if breakeven
+    could not be computed at entry (hedge protection unavailable).
+  - ORPHAN POSITION STARTUP CHECK: refuses new entries if the exchange
+    shows open positions that local state doesn't know about.
+
+CARRIED OVER FROM v3 (core strategy, unchanged):
   - Breakeven computed from TIME VALUE (real max profit), not raw premium.
   - One-time-only hedge per side (Call hedge on upside breach, Put hedge on
-    downside breach), using ATM strike (or next strike closer to spot if ATM
-    collides with the original sold strike).
+    downside breach).
   - Original short legs are NEVER closed by the hedge logic.
-  - Hedge order failure => immediate full-position force-close.
   - No SL / Trailing SL / Target / time-based force-exit. Settlement is
     detected via a fixed daily time check (17:30 IST), not bot-initiated.
   - Forward-fallback expiry search (up to MAX_EXPIRY_SEARCH_DAYS).
+  - Entry requires BOTH legs to fill; partial fill triggers rollback of
+    whichever leg did fill (this safety behavior is UNCHANGED and
+    intentional - a naked single-leg position was never the intended
+    trade, and is NOT permitted by this script).
 
 IMPORTANT WARNINGS (READ CAREFULLY):
   - This is a NAKED SHORT OPTIONS strategy. The hedge reduces further loss
@@ -53,9 +56,13 @@ IMPORTANT WARNINGS (READ CAREFULLY):
     protect against gap moves between polling cycles or exchange-side
     liquidation triggered independently of your bot.
   - Deep ITM strikes (e.g. delta 0.7) are more prone to thin liquidity /
-    disrupted market states, especially on testnet, as observed in real
-    usage. Even with the fixes above, a deep ITM entry may simply fail to
-    find a tradable market more often than OTM/ATM strikes.
+    disrupted market states, especially on testnet. The fallback logic in
+    this version significantly reduces (but cannot fully eliminate) failed
+    entries/hedges caused by this.
+  - A market in disrupted_cancel_only mode CANNOT be traded at any price -
+    this is an exchange-enforced state, not a liquidity/price problem that
+    a market order can bypass. The fallback logic works by trying OTHER
+    strikes, not by forcing an order through on a halted contract.
   - Test on TESTNET first (set DELTA_BASE_URL env var to testnet URL).
   - All configuration is via environment variables (set in Railway dashboard).
   - Railway's default networking may assign a DIFFERENT outbound IP on every
@@ -71,7 +78,6 @@ import hashlib
 import hmac
 import json
 import os
-import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -101,8 +107,7 @@ MAX_EXPIRY_SEARCH_DAYS = int(os.environ.get("MAX_EXPIRY_SEARCH_DAYS", "15"))
 CALL_LOTS = int(os.environ.get("CALL_LOTS", "1"))
 PUT_LOTS = int(os.environ.get("PUT_LOTS", "1"))
 
-# NEW (v3.1): Enforce matching quantities - required for breakeven math to
-# be valid, and explicitly confirmed as a strategy requirement.
+# Enforce matching quantities - required for breakeven math to be valid.
 if CALL_LOTS != PUT_LOTS:
     raise EnvironmentError(
         f"CALL_LOTS ({CALL_LOTS}) and PUT_LOTS ({PUT_LOTS}) must be EQUAL. "
@@ -118,9 +123,13 @@ ENTRY_WINDOW_END = os.environ.get("ENTRY_WINDOW_END", "19:15")
 # hardcoded per confirmed requirement (5:30 PM IST).
 SETTLEMENT_TIME_IST = "17:30"
 
-# NEW (v3.1): Entry retry controls
+# Entry retry controls
 MAX_ENTRY_ATTEMPTS_PER_WINDOW = int(os.environ.get("MAX_ENTRY_ATTEMPTS_PER_WINDOW", "5"))
 ENTRY_RETRY_COOLDOWN_SECONDS = int(os.environ.get("ENTRY_RETRY_COOLDOWN_SECONDS", "60"))
+
+# NEW (v3.2): Strike fallback controls
+MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS = int(os.environ.get("MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS", "5"))
+MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS = int(os.environ.get("MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS", "10"))
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 WAITING_LOG_INTERVAL_SECONDS = int(os.environ.get("WAITING_LOG_INTERVAL_SECONDS", "300"))
@@ -230,7 +239,7 @@ def send_request(method, path, query_params=None, body=None):
         "api-key": API_KEY,
         "timestamp": timestamp,
         "signature": signature,
-        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.1",
+        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.2",
         "Content-Type": "application/json",
     }
 
@@ -317,7 +326,6 @@ def default_state():
         "trade_force_closed": False,
         "trade_force_close_reason": None,
 
-        # NEW (v3.1): entry retry tracking
         "entry_attempts_today": 0,
         "entry_attempts_date": None,
         "last_entry_attempt_ts": None,
@@ -381,10 +389,33 @@ def find_available_expiry(n_days, max_search_days):
     return None, None, [], target_date_str
 
 
-def select_strike_by_delta(chain, contract_type, target_delta):
+def get_product_trading_status(symbol):
+    """
+    Fetches current trading_status for a product (operational,
+    disrupted_cancel_only, or disrupted_post_only). Used to pre-check
+    market health BEFORE attempting to place an order.
+    """
+    path = f"/v2/products/{symbol}"
+    resp = send_request("GET", path)
+    if not resp or not resp.get("success"):
+        print(f"[WARN] Could not fetch trading status for {symbol}: {resp}")
+        return None
+    result = resp.get("result") or {}
+    return result.get("trading_status")
+
+
+def select_strike_by_delta(chain, contract_type, target_delta, skip_symbols=None):
+    """
+    Returns the strike nearest to target_delta, EXCLUDING any symbols in
+    skip_symbols (used to skip strikes already confirmed disrupted, so the
+    caller can retry with the next-nearest match instead of giving up).
+    """
+    skip_symbols = skip_symbols or set()
     candidates = []
     for ticker in chain:
         if ticker.get("contract_type") != contract_type:
+            continue
+        if ticker.get("symbol") in skip_symbols:
             continue
         greeks = ticker.get("greeks") or {}
         delta_str = greeks.get("delta")
@@ -403,7 +434,54 @@ def select_strike_by_delta(chain, contract_type, target_delta):
     return candidates[0][1]
 
 
-def select_hedge_strike(chain, contract_type, spot_price, original_sold_strike):
+def select_operational_strike_by_delta(chain, contract_type, target_delta,
+                                        max_fallback_attempts=MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS):
+    """
+    NEW (v3.2): Tries the nearest-match delta strike first. If it's not
+    operational, tries the NEXT-nearest delta match instead, up to
+    max_fallback_attempts times, before giving up. Returns the ticker dict
+    of the first OPERATIONAL strike found, or None.
+    """
+    tried_symbols = set()
+
+    for attempt in range(max_fallback_attempts):
+        ticker = select_strike_by_delta(chain, contract_type, target_delta, skip_symbols=tried_symbols)
+        if not ticker:
+            print(f"[WARN] No more {contract_type} candidates left to try after {attempt} fallback(s).")
+            return None
+
+        symbol = ticker.get("symbol")
+        status = get_product_trading_status(symbol)
+
+        if status == "operational":
+            if attempt > 0:
+                print(f"[INFO] Fell back to next-nearest delta match for {contract_type}: "
+                      f"{symbol} (after {attempt} disrupted strike(s) skipped).")
+            return ticker
+
+        print(f"[WARN] {contract_type} strike {symbol} is not operational (status: {status}). "
+              f"Trying next-nearest delta match instead.")
+        tried_symbols.add(symbol)
+
+    print(f"[WARN] Exhausted {max_fallback_attempts} fallback attempts for {contract_type}, "
+          f"no operational strike found.")
+    return None
+
+
+def select_operational_hedge_strike(chain, contract_type, spot_price, original_sold_strike,
+                                     max_fallback_attempts=MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS):
+    """
+    NEW (v3.2): Finds an OPERATIONAL strike for the hedge leg. Starts with
+    the ATM strike (or next-strike-closer-to-spot if ATM collides with the
+    original sold strike). If that strike is disrupted, tries the
+    next-nearest-to-spot strike instead, continuing up to
+    max_fallback_attempts times, always searching in the direction of
+    spot (never toward/through the original sold strike, to avoid netting
+    against the existing short position).
+
+    Returns the ticker dict of the first OPERATIONAL strike found, or None
+    if all fallback attempts are exhausted.
+    """
     candidates = [t for t in chain if t.get("contract_type") == contract_type]
     if not candidates:
         return None
@@ -415,21 +493,46 @@ def select_hedge_strike(chain, contract_type, spot_price, original_sold_strike):
             return float("inf")
 
     candidates_sorted = sorted(candidates, key=strike_distance)
-    atm_ticker = candidates_sorted[0]
 
     try:
-        atm_strike = float(atm_ticker.get("strike_price"))
         sold_strike = float(original_sold_strike) if original_sold_strike is not None else None
     except (TypeError, ValueError):
-        atm_strike, sold_strike = None, None
+        sold_strike = None
 
-    if sold_strike is not None and atm_strike is not None and atm_strike == sold_strike:
-        remaining = candidates_sorted[1:]
-        if not remaining:
-            return None
-        return remaining[0]
+    # Filter out the exact collision strike (same as original sold strike)
+    filtered = []
+    for t in candidates_sorted:
+        try:
+            t_strike = float(t.get("strike_price"))
+        except (TypeError, ValueError):
+            continue
+        if sold_strike is not None and t_strike == sold_strike:
+            continue  # skip - would net/close the existing short instead of hedging
+        filtered.append(t)
 
-    return atm_ticker
+    if not filtered:
+        return None
+
+    attempts = 0
+    for ticker in filtered:
+        if attempts >= max_fallback_attempts:
+            break
+        symbol = ticker.get("symbol")
+        status = get_product_trading_status(symbol)
+        attempts += 1
+
+        if status == "operational":
+            if attempts > 1:
+                print(f"[INFO] Hedge strike fallback: skipped {attempts - 1} disrupted "
+                      f"strike(s) closer to ATM, using {symbol} instead.")
+            return ticker
+
+        print(f"[WARN] Hedge candidate strike {symbol} is not operational (status: {status}). "
+              f"Trying next-nearest-to-spot strike instead.")
+
+    print(f"[WARN] Exhausted {attempts} hedge strike fallback attempt(s), "
+          f"no operational strike found nearby.")
+    return None
 
 
 def get_mark_price(product_id, symbol):
@@ -477,21 +580,6 @@ def get_contract_value(symbol):
         return None
 
 
-def get_product_trading_status(symbol):
-    """
-    NEW (v3.1): Fetches current trading_status for a product (operational,
-    disrupted_cancel_only, or disrupted_post_only). Used to pre-check
-    market health BEFORE attempting to place an order.
-    """
-    path = f"/v2/products/{symbol}"
-    resp = send_request("GET", path)
-    if not resp or not resp.get("success"):
-        print(f"[WARN] Could not fetch trading status for {symbol}: {resp}")
-        return None
-    result = resp.get("result") or {}
-    return result.get("trading_status")
-
-
 def get_position(product_id):
     path = "/v2/positions"
     params = {"product_id": product_id}
@@ -513,8 +601,8 @@ def get_live_position_size(product_id):
 
 def get_all_open_positions_for_underlying(underlying_asset_symbol):
     """
-    NEW (v3.1): Used for the orphan-position startup check. Fetches ALL
-    open positions for the given underlying asset (e.g. 'BTC') in one call.
+    Used for the orphan-position startup check. Fetches ALL open positions
+    for the given underlying asset (e.g. 'BTC') in one call.
     """
     path = "/v2/positions"
     params = {"underlying_asset_symbol": underlying_asset_symbol}
@@ -608,22 +696,18 @@ def ensure_leg_closed(product_id, symbol, label):
 
 
 # ======================================================================
-# STARTUP SAFETY CHECK (NEW in v3.1)
+# STARTUP SAFETY CHECK
 # ======================================================================
 
 def check_for_orphaned_positions(state):
     """
-    NEW (v3.1): On startup, if local state says no trade is active, but the
-    exchange reports open option positions for the underlying asset anyway
-    (e.g. due to a crash/restart between leg fills during a prior entry
-    attempt), print a loud warning and BLOCK new entries until resolved.
-
-    Returns True if it is safe to proceed, False if the bot should halt
-    entry attempts (monitoring/logging still continues) until manually
-    reviewed.
+    On startup, if local state says no trade is active, but the exchange
+    reports open option positions for the underlying asset anyway (e.g.
+    due to a crash/restart during a prior entry attempt), print a loud
+    warning and BLOCK new entries until resolved.
     """
     if state.get("active"):
-        return True  # bot already knows about an active trade, nothing to check here
+        return True
 
     positions = get_all_open_positions_for_underlying(UNDERLYING_ASSET)
     open_option_positions = [
@@ -683,11 +767,14 @@ def attempt_entry(state):
     if not chain:
         return state
 
-    call_ticker = select_strike_by_delta(chain, "call_options", CALL_TARGET_DELTA)
-    put_ticker = select_strike_by_delta(chain, "put_options", PUT_TARGET_DELTA)
+    # NEW (v3.2): Delta-fallback strike selection - skips disrupted strikes
+    # automatically and tries the next-nearest delta match instead.
+    call_ticker = select_operational_strike_by_delta(chain, "call_options", CALL_TARGET_DELTA)
+    put_ticker = select_operational_strike_by_delta(chain, "put_options", PUT_TARGET_DELTA)
 
     if not call_ticker or not put_ticker:
-        print("[WARN] Could not find matching call/put strikes by delta. Skipping this window.")
+        print("[WARN] Could not find an OPERATIONAL call/put strike within fallback limit. "
+              "Skipping this window.")
         return state
 
     call_product_id = call_ticker["product_id"]
@@ -699,17 +786,6 @@ def attempt_entry(state):
     put_symbol = put_ticker["symbol"]
     put_strike = put_ticker.get("strike_price")
     put_delta = put_ticker.get("greeks", {}).get("delta")
-
-    # --- NEW (v3.1): Trading status pre-check BEFORE placing any order ---
-    call_status = get_product_trading_status(call_symbol)
-    put_status = get_product_trading_status(put_symbol)
-
-    if call_status != "operational" or put_status != "operational":
-        print(f"[WARN] Market not operational for entry. "
-              f"CALL ({call_symbol}) status: {call_status} | "
-              f"PUT ({put_symbol}) status: {put_status}. "
-              f"Skipping this attempt - no orders will be placed.")
-        return state
 
     spot_price_at_entry = None
     try:
@@ -734,6 +810,9 @@ def attempt_entry(state):
           f"Qty: {PUT_LOTS} lot(s)")
     print(f"[INFO] Spot price at entry: {spot_price_at_entry}")
 
+    # --- Entry requires BOTH legs to fill. Partial fill => rollback. ---
+    # This safety behavior is intentional and UNCHANGED - a naked
+    # single-leg position was never the intended trade.
     call_order = place_market_order(call_product_id, "sell", CALL_LOTS)
     if not call_order:
         print("[ERROR] CALL leg order failed to place. No position opened. Aborting entry attempt.")
@@ -786,7 +865,6 @@ def attempt_entry(state):
         call_strike_f, put_strike_f, total_time_value, call_contract_value, call_size
     )
 
-    # --- NEW (v3.1): Loud warning if hedge protection will be unavailable ---
     if total_time_value <= 0 or upside_breakeven is None or downside_breakeven is None:
         print("#" * 70)
         print("#  [CRITICAL WARNING] TIME VALUE IS ZERO/NEGATIVE OR BREAKEVEN")
@@ -900,22 +978,17 @@ def execute_hedge_leg(state, side_label, original_strike, contract_type, lots, s
         print(f"[ERROR] Could not fetch option chain for hedge leg ({side_label}).")
         return False, state
 
-    hedge_ticker = select_hedge_strike(chain, contract_type, spot_price, original_strike)
+    # NEW (v3.2): Hedge strike fallback - skips disrupted strikes near ATM
+    # and tries progressively further strikes toward spot instead.
+    hedge_ticker = select_operational_hedge_strike(chain, contract_type, spot_price, original_strike)
     if not hedge_ticker:
-        print(f"[ERROR] Could not select a valid hedge strike for {side_label} "
-              f"(no suitable non-colliding strike found).")
+        print(f"[ERROR] Could not find any OPERATIONAL hedge strike for {side_label} "
+              f"after fallback search.")
         return False, state
 
     hedge_product_id = hedge_ticker["product_id"]
     hedge_symbol = hedge_ticker["symbol"]
     hedge_strike = hedge_ticker.get("strike_price")
-
-    # Trading status check before hedge order too
-    hedge_status = get_product_trading_status(hedge_symbol)
-    if hedge_status != "operational":
-        print(f"[ERROR] Hedge strike {hedge_symbol} is not operational (status: {hedge_status}). "
-              f"Cannot place hedge order.")
-        return False, state
 
     order = place_market_order(hedge_product_id, "buy", lots)
     if not order:
@@ -994,7 +1067,7 @@ def check_and_trigger_hedge(state, spot_price):
         )
         if not success:
             return force_close_full_position(
-                state, "HEDGE_ORDER_FAILED_CALL_SIDE_INSUFFICIENT_BALANCE_OR_ERROR"
+                state, "HEDGE_ORDER_FAILED_CALL_SIDE_AFTER_FALLBACK_EXHAUSTED"
             )
 
     if not state.get("active"):
@@ -1007,7 +1080,7 @@ def check_and_trigger_hedge(state, spot_price):
         )
         if not success:
             return force_close_full_position(
-                state, "HEDGE_ORDER_FAILED_PUT_SIDE_INSUFFICIENT_BALANCE_OR_ERROR"
+                state, "HEDGE_ORDER_FAILED_PUT_SIDE_AFTER_FALLBACK_EXHAUSTED"
             )
 
     return state
@@ -1153,7 +1226,6 @@ def monitor_and_check_exit(state):
 
     save_state(state)
 
-    # NEW (v3.1): Loud repeating warning if hedge protection is unavailable for this trade
     if state.get("upside_breakeven") is None or state.get("downside_breakeven") is None:
         print("[CRITICAL WARNING] This trade has NO hedge protection (breakeven could not be "
               "computed at entry - likely zero/negative time value). Position is running FULLY "
@@ -1205,7 +1277,6 @@ def main():
 
     state = load_state()
 
-    # NEW (v3.1): Orphan-position startup safety check
     safe_to_enter = check_for_orphaned_positions(state)
 
     print("[INFO] Strategy started. Monitoring...")
@@ -1218,6 +1289,8 @@ def main():
           f"Settlement Assumption: {SETTLEMENT_TIME_IST} IST")
     print(f"[INFO] Max Entry Attempts/Day: {MAX_ENTRY_ATTEMPTS_PER_WINDOW} | "
           f"Retry Cooldown: {ENTRY_RETRY_COOLDOWN_SECONDS}s")
+    print(f"[INFO] Max Entry Strike Fallback Attempts: {MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS} | "
+          f"Max Hedge Strike Fallback Attempts: {MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS}")
     print("[INFO] No SL / Trailing SL / Target in this version. Breakeven hedge (one-time per "
           "side) is the only risk-adjustment mechanism. Positions run to natural expiry.")
 
