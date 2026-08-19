@@ -1,6 +1,6 @@
 """
-Delta Exchange - BTC Options Short Strangle Strategy (v3 - Breakeven Hedge Edition)
-=====================================================================================
+Delta Exchange - BTC Options Short Strangle Strategy (v3.1 - Breakeven Hedge Edition)
+========================================================================================
 This is a NEW, SEPARATE version. It does NOT modify or replace main.py (v1) or the
 v2 SL/Target/Trailing-SL script - deploy this as its own repo/service.
 
@@ -10,60 +10,68 @@ IST time window. NO stop loss, trailing stop loss, or target exit exists in this
 version - positions are intended to run to natural expiry/settlement on the
 exchange.
 
-WHAT CHANGED FROM v2 (SL/Target/Trailing-SL version):
-  - REMOVED: Fixed SL, Trailing SL, Target, and time-based force-exit. None of
-    that logic exists in this file.
-  - ADDED: Breakeven-based ONE-TIME hedge per side:
-      * Breakeven levels are computed using TIME VALUE (real max profit
-        potential), NOT raw premium collected - this matters especially for
-        ITM strikes where premium looks large but time value (true max
-        profit) is much smaller.
-      * If underlying spot price closes ABOVE the upside breakeven, the bot
-        BUYS (goes long) a NEW, ADDITIONAL Call option at the ATM strike
-        (or the next strike closer to spot if ATM happens to collide with
-        the already-sold Call's strike, to avoid netting/closing the
-        existing short). This is a hedge added ON TOP of the existing short
-        Call - the original short Call is NEVER closed by this logic.
-      * Same logic mirrored for the Put side on a downside breach.
-      * Each side hedges AT MOST ONCE per trade - it will never re-trigger
-        even if price crosses back and forth across the breakeven multiple
-        times.
-      * If the hedge buy order fails for ANY reason (insufficient balance,
-        API error, no liquidity, etc.), the bot treats this as an
-        emergency: it immediately market-closes the ENTIRE position (all
-        legs, including any hedge already active on the other side) to
-        avoid running a naked, un-hedged, un-stopped short position.
-  - Settlement is NOT bot-initiated. The bot does not place any closing
-    order at expiry. It simply detects that the fixed daily settlement time
-    (17:30 IST) has passed on the trade's expiry date, logs a final summary,
-    and resets state to search for the next entry.
+WHAT CHANGED IN v3.1 (bug fixes on top of v3):
+  1. TRADING STATUS PRE-CHECK: Before placing ANY order, both the Call and Put
+     legs' trading_status is checked. If either is not "operational" (e.g.
+     market_disrupted_cancel_only_mode), the entry attempt is skipped entirely -
+     no orders are placed, no rollback needed. This fixes a real incident where
+     the bot kept placing the Call leg, having the Put leg rejected due to a
+     disrupted market, rolling back, and immediately retrying every poll cycle.
+  2. ENTRY RETRY CAP + COOLDOWN: Failed entry attempts are now capped per day
+     (MAX_ENTRY_ATTEMPTS_PER_WINDOW) with a cooldown between attempts
+     (ENTRY_RETRY_COOLDOWN_SECONDS), instead of retrying every single poll
+     cycle (~every 10 seconds) for the entire entry window.
+  3. LOT SIZE VALIDATION: Bot now refuses to start if CALL_LOTS != PUT_LOTS,
+     since mismatched quantities would silently corrupt the breakeven
+     calculation (which assumes equal quantities on both legs).
+  4. ZERO/NEGATIVE TIME VALUE WARNING: If computed time value is <= 0 at entry
+     (common for deep ITM strikes near expiry), breakeven levels cannot be
+     computed and hedge protection is effectively disabled for that trade.
+     The bot now prints a LOUD, REPEATING warning every monitoring cycle in
+     this case, instead of silently running unprotected.
+  5. ORPHAN POSITION STARTUP CHECK: On startup, if local state says no trade
+     is active, but the exchange reports open BTC option positions anyway
+     (e.g. due to a crash/restart between leg fills), the bot prints a loud
+     warning listing the orphaned position(s) and REFUSES to start a new
+     entry cycle until resolved manually. This prevents accidental duplicate
+     exposure.
+
+EVERYTHING ELSE FROM v3 UNCHANGED:
+  - Breakeven computed from TIME VALUE (real max profit), not raw premium.
+  - One-time-only hedge per side (Call hedge on upside breach, Put hedge on
+    downside breach), using ATM strike (or next strike closer to spot if ATM
+    collides with the original sold strike).
+  - Original short legs are NEVER closed by the hedge logic.
+  - Hedge order failure => immediate full-position force-close.
+  - No SL / Trailing SL / Target / time-based force-exit. Settlement is
+    detected via a fixed daily time check (17:30 IST), not bot-initiated.
+  - Forward-fallback expiry search (up to MAX_EXPIRY_SEARCH_DAYS).
 
 IMPORTANT WARNINGS (READ CAREFULLY):
-  - This is a NAKED SHORT OPTIONS strategy with NO stop loss whatsoever on
-    the original short legs. The hedge added on breakeven breach REDUCES
-    the rate of further loss on that side, but it does NOT cap losses to
-    zero, and does not protect against gap moves between polling cycles.
-  - Delta Exchange's own risk engine may liquidate a naked short position
-    for margin shortfall BEFORE your breakeven is reached or before your
-    bot's next poll cycle runs. This risk is materially higher for ITM
-    delta selections (e.g., 0.7 / -0.7) versus OTM deltas.
+  - This is a NAKED SHORT OPTIONS strategy. The hedge reduces further loss
+    RATE on a breached side but does not cap losses to zero, and does not
+    protect against gap moves between polling cycles or exchange-side
+    liquidation triggered independently of your bot.
+  - Deep ITM strikes (e.g. delta 0.7) are more prone to thin liquidity /
+    disrupted market states, especially on testnet, as observed in real
+    usage. Even with the fixes above, a deep ITM entry may simply fail to
+    find a tradable market more often than OTM/ATM strikes.
   - Test on TESTNET first (set DELTA_BASE_URL env var to testnet URL).
   - All configuration is via environment variables (set in Railway dashboard).
   - Railway's default networking may assign a DIFFERENT outbound IP on every
     redeploy/restart unless a static IP feature is enabled on your plan.
     Re-check the IP banner after every redeploy and update Delta's whitelist.
-  - Settlement detection in this script relies on a FIXED time check
-    (17:30 IST) rather than an exchange "settled" event/webhook. If Delta's
-    actual settlement/position-clearing timing ever differs from this
-    assumption, the final P&L summary logged by the bot may not perfectly
-    match what actually happened on the exchange. Always cross-check final
-    P&L against your Delta Exchange fills/positions history.
+  - Settlement detection relies on a FIXED time assumption (17:30 IST) as
+    explicitly confirmed by the user, not a documented exchange guarantee.
+    Cross-check final P&L against your actual Delta Exchange fills/positions
+    history, especially during initial testing.
 """
 
 import hashlib
 import hmac
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -93,6 +101,15 @@ MAX_EXPIRY_SEARCH_DAYS = int(os.environ.get("MAX_EXPIRY_SEARCH_DAYS", "15"))
 CALL_LOTS = int(os.environ.get("CALL_LOTS", "1"))
 PUT_LOTS = int(os.environ.get("PUT_LOTS", "1"))
 
+# NEW (v3.1): Enforce matching quantities - required for breakeven math to
+# be valid, and explicitly confirmed as a strategy requirement.
+if CALL_LOTS != PUT_LOTS:
+    raise EnvironmentError(
+        f"CALL_LOTS ({CALL_LOTS}) and PUT_LOTS ({PUT_LOTS}) must be EQUAL. "
+        f"Mismatched quantities will silently corrupt breakeven calculations. "
+        f"Fix your environment variables before restarting."
+    )
+
 # Entry window: 7:00 PM - 7:15 PM IST (confirmed)
 ENTRY_WINDOW_START = os.environ.get("ENTRY_WINDOW_START", "19:00")
 ENTRY_WINDOW_END = os.environ.get("ENTRY_WINDOW_END", "19:15")
@@ -100,6 +117,10 @@ ENTRY_WINDOW_END = os.environ.get("ENTRY_WINDOW_END", "19:15")
 # Fixed daily settlement time assumption for options - NOT configurable,
 # hardcoded per confirmed requirement (5:30 PM IST).
 SETTLEMENT_TIME_IST = "17:30"
+
+# NEW (v3.1): Entry retry controls
+MAX_ENTRY_ATTEMPTS_PER_WINDOW = int(os.environ.get("MAX_ENTRY_ATTEMPTS_PER_WINDOW", "5"))
+ENTRY_RETRY_COOLDOWN_SECONDS = int(os.environ.get("ENTRY_RETRY_COOLDOWN_SECONDS", "60"))
 
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 WAITING_LOG_INTERVAL_SECONDS = int(os.environ.get("WAITING_LOG_INTERVAL_SECONDS", "300"))
@@ -132,11 +153,7 @@ def format_timedelta(td):
 
 
 def combine_expiry(expiry_date_obj):
-    """
-    Approximate expiry moment for DISPLAY purposes only (the "Time to
-    Expiry" countdown in monitoring logs). The actual settlement detection
-    used by the bot is governed independently by SETTLEMENT_TIME_IST.
-    """
+    """Display-only approximate expiry moment for 'Time to Expiry' logs."""
     return datetime(
         expiry_date_obj.year, expiry_date_obj.month, expiry_date_obj.day,
         21, 30, 0, tzinfo=IST
@@ -213,7 +230,7 @@ def send_request(method, path, query_params=None, body=None):
         "api-key": API_KEY,
         "timestamp": timestamp,
         "signature": signature,
-        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3",
+        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.1",
         "Content-Type": "application/json",
     }
 
@@ -299,6 +316,11 @@ def default_state():
 
         "trade_force_closed": False,
         "trade_force_close_reason": None,
+
+        # NEW (v3.1): entry retry tracking
+        "entry_attempts_today": 0,
+        "entry_attempts_date": None,
+        "last_entry_attempt_ts": None,
     }
 
 
@@ -339,14 +361,6 @@ def get_option_chain(expiry_date_ddmmyyyy):
 
 
 def find_available_expiry(n_days, max_search_days):
-    """
-    Forward-fallback expiry search (unchanged from v2). Computes target
-    expiry as today + n_days. If no chain listed, searches forward day by
-    day up to max_search_days, and uses the nearest available expiry with
-    a non-empty chain. The N-day target is always recalculated fresh at
-    each new entry attempt, so re-entries after a long fallback (e.g. 15
-    days) will again target N days from THAT point in time.
-    """
     today = now_ist().date()
     target_date = today + timedelta(days=n_days)
     target_date_str = target_date.strftime("%d-%m-%Y")
@@ -390,13 +404,6 @@ def select_strike_by_delta(chain, contract_type, target_delta):
 
 
 def select_hedge_strike(chain, contract_type, spot_price, original_sold_strike):
-    """
-    Selects the ATM strike (nearest to current spot) for the hedge leg.
-    If that ATM strike is the SAME as the strike already sold (which would
-    net/close the existing short instead of adding a hedge), falls back to
-    the NEXT strike closer to spot among the remaining candidates.
-    Returns the ticker dict, or None if no suitable strike is found.
-    """
     candidates = [t for t in chain if t.get("contract_type") == contract_type]
     if not candidates:
         return None
@@ -420,7 +427,7 @@ def select_hedge_strike(chain, contract_type, spot_price, original_sold_strike):
         remaining = candidates_sorted[1:]
         if not remaining:
             return None
-        return remaining[0]  # next strike closest to spot after excluding the collision
+        return remaining[0]
 
     return atm_ticker
 
@@ -439,11 +446,6 @@ def get_mark_price(product_id, symbol):
 
 
 def get_underlying_spot_price():
-    """
-    Fetches the underlying index/spot price used for breakeven breach
-    comparisons. Uses Delta's index symbol convention (.DE prefix). BTC is
-    a special case (.DEXBTUSD) per Delta's symbology documentation.
-    """
     if UNDERLYING_ASSET.upper() == "BTC":
         index_symbol = ".DEXBTUSD"
     else:
@@ -475,6 +477,21 @@ def get_contract_value(symbol):
         return None
 
 
+def get_product_trading_status(symbol):
+    """
+    NEW (v3.1): Fetches current trading_status for a product (operational,
+    disrupted_cancel_only, or disrupted_post_only). Used to pre-check
+    market health BEFORE attempting to place an order.
+    """
+    path = f"/v2/products/{symbol}"
+    resp = send_request("GET", path)
+    if not resp or not resp.get("success"):
+        print(f"[WARN] Could not fetch trading status for {symbol}: {resp}")
+        return None
+    result = resp.get("result") or {}
+    return result.get("trading_status")
+
+
 def get_position(product_id):
     path = "/v2/positions"
     params = {"product_id": product_id}
@@ -494,16 +511,26 @@ def get_live_position_size(product_id):
         return 0
 
 
+def get_all_open_positions_for_underlying(underlying_asset_symbol):
+    """
+    NEW (v3.1): Used for the orphan-position startup check. Fetches ALL
+    open positions for the given underlying asset (e.g. 'BTC') in one call.
+    """
+    path = "/v2/positions"
+    params = {"underlying_asset_symbol": underlying_asset_symbol}
+    resp = send_request("GET", path, query_params=params)
+    if not resp or not resp.get("success"):
+        print(f"[WARN] Could not fetch open positions for {underlying_asset_symbol}: {resp}")
+        return []
+    result = resp.get("result")
+    if result is None:
+        return []
+    if isinstance(result, list):
+        return result
+    return [result]
+
+
 def get_margin_and_pnl_for_products(product_ids):
-    """
-    Fetches margin and realized_pnl for a list of product_ids using
-    /v2/positions/margined. Returns a dict keyed by product_id with
-    {"margin": float, "realized_pnl": float or None}.
-    NOTE: Once a position is fully settled/closed by the exchange, it may
-    no longer appear in this endpoint's response. Callers should treat a
-    missing product_id in the result as "unavailable" and fall back to
-    last-known mark-price-based estimates if needed.
-    """
     if not product_ids:
         return {}
     path = "/v2/positions/margined"
@@ -560,11 +587,6 @@ def wait_for_fill_and_get_entry_price(product_id, retries=6, delay=2):
 
 
 def ensure_leg_closed(product_id, symbol, label):
-    """
-    Ensures a leg is closed on the exchange. Checks LIVE position first -
-    if already flat, treats as success without placing a redundant order.
-    Returns True if confirmed flat, False otherwise.
-    """
     live_size = get_live_position_size(product_id)
 
     if live_size == 0:
@@ -586,20 +608,54 @@ def ensure_leg_closed(product_id, symbol, label):
 
 
 # ======================================================================
+# STARTUP SAFETY CHECK (NEW in v3.1)
+# ======================================================================
+
+def check_for_orphaned_positions(state):
+    """
+    NEW (v3.1): On startup, if local state says no trade is active, but the
+    exchange reports open option positions for the underlying asset anyway
+    (e.g. due to a crash/restart between leg fills during a prior entry
+    attempt), print a loud warning and BLOCK new entries until resolved.
+
+    Returns True if it is safe to proceed, False if the bot should halt
+    entry attempts (monitoring/logging still continues) until manually
+    reviewed.
+    """
+    if state.get("active"):
+        return True  # bot already knows about an active trade, nothing to check here
+
+    positions = get_all_open_positions_for_underlying(UNDERLYING_ASSET)
+    open_option_positions = [
+        p for p in positions
+        if p.get("size") and int(p.get("size", 0)) != 0
+    ]
+
+    if open_option_positions:
+        print("#" * 70)
+        print("#  [CRITICAL WARNING] ORPHANED POSITION(S) DETECTED ON STARTUP")
+        print("#  Local state shows NO active trade, but the exchange reports")
+        print("#  the following OPEN position(s) for this underlying asset:")
+        for p in open_option_positions:
+            print(f"#    - Symbol: {p.get('product_symbol')} | Size: {p.get('size')} | "
+                  f"Entry Price: {p.get('entry_price')}")
+        print("#  This likely happened due to a crash/restart during a previous")
+        print("#  entry attempt, between leg fills. The bot will NOT start any")
+        print("#  new entry cycle until this is resolved.")
+        print("#  ACTION REQUIRED: Manually review and close/manage these")
+        print("#  position(s) on Delta Exchange, then restart the bot.")
+        print("#" * 70)
+        return False
+
+    return True
+
+
+# ======================================================================
 # BREAKEVEN CALCULATION
 # ======================================================================
 
 def calculate_breakeven_levels(call_strike, put_strike, total_time_value,
                                 call_contract_value, call_size):
-    """
-    Breakeven based on REAL MAX PROFIT (time value), not raw premium, per
-    confirmed requirement. Assumes call_size and put_size are equal (per
-    confirmed requirement that hedge/entry quantity must be identical on
-    both sides).
-
-    Upside Breakeven  = Call Strike + (Total Time Value / total underlying units)
-    Downside Breakeven = Put Strike - (Total Time Value / total underlying units)
-    """
     try:
         total_units = call_contract_value * abs(call_size)
         if total_units == 0:
@@ -643,6 +699,17 @@ def attempt_entry(state):
     put_symbol = put_ticker["symbol"]
     put_strike = put_ticker.get("strike_price")
     put_delta = put_ticker.get("greeks", {}).get("delta")
+
+    # --- NEW (v3.1): Trading status pre-check BEFORE placing any order ---
+    call_status = get_product_trading_status(call_symbol)
+    put_status = get_product_trading_status(put_symbol)
+
+    if call_status != "operational" or put_status != "operational":
+        print(f"[WARN] Market not operational for entry. "
+              f"CALL ({call_symbol}) status: {call_status} | "
+              f"PUT ({put_symbol}) status: {put_status}. "
+              f"Skipping this attempt - no orders will be placed.")
+        return state
 
     spot_price_at_entry = None
     try:
@@ -715,13 +782,20 @@ def attempt_entry(state):
     put_time_value = max(put_premium - put_intrinsic, 0.0)
     total_time_value = call_time_value + put_time_value
 
-    if total_time_value <= 0:
-        print("[WARN] Computed max profit potential (time value) is zero or negative. "
-              "This can happen for deep ITM strikes near expiry.")
-
     upside_breakeven, downside_breakeven = calculate_breakeven_levels(
         call_strike_f, put_strike_f, total_time_value, call_contract_value, call_size
     )
+
+    # --- NEW (v3.1): Loud warning if hedge protection will be unavailable ---
+    if total_time_value <= 0 or upside_breakeven is None or downside_breakeven is None:
+        print("#" * 70)
+        print("#  [CRITICAL WARNING] TIME VALUE IS ZERO/NEGATIVE OR BREAKEVEN")
+        print("#  COULD NOT BE COMPUTED. HEDGE PROTECTION WILL BE UNAVAILABLE")
+        print("#  FOR THIS ENTIRE TRADE. This commonly happens with deep ITM")
+        print("#  strikes near expiry. The position will run FULLY NAKED AND")
+        print("#  UNPROTECTED until natural expiry. Proceeding per configured")
+        print("#  delta settings, but consider reviewing your delta targets.")
+        print("#" * 70)
 
     margin_data = get_margin_and_pnl_for_products([call_product_id, put_product_id])
     margin_utilized_at_entry = 0.0
@@ -807,9 +881,9 @@ def attempt_entry(state):
     print(f"TOTAL PREMIUM RECEIVED: ${total_premium:.4f}")
     print(f"TOTAL TIME VALUE (Real Max Profit Potential, no breakout): ${total_time_value:.4f}")
     print(f"UPSIDE BREAKEVEN (Call hedge triggers above this): "
-          f"{'%.4f' % upside_breakeven if upside_breakeven is not None else 'N/A'}")
+          f"{'%.4f' % upside_breakeven if upside_breakeven is not None else 'N/A - HEDGE DISABLED'}")
     print(f"DOWNSIDE BREAKEVEN (Put hedge triggers below this): "
-          f"{'%.4f' % downside_breakeven if downside_breakeven is not None else 'N/A'}")
+          f"{'%.4f' % downside_breakeven if downside_breakeven is not None else 'N/A - HEDGE DISABLED'}")
     print(f"MARGIN UTILIZED AT ENTRY: ${margin_utilized_at_entry:.4f}")
     print("=" * 70)
 
@@ -820,15 +894,7 @@ def attempt_entry(state):
 # STRATEGY LOGIC - HEDGE TRIGGER
 # ======================================================================
 
-def execute_hedge_leg(state, side_label, original_strike, target_delta_unused,
-                       contract_type, lots, spot_price):
-    """
-    Attempts to place the hedge BUY order for the given side ('CALL' or
-    'PUT'). Returns (success: bool, updated_state).
-    On any failure (strike selection failure, order rejection, fill not
-    confirmed), returns success=False - caller is responsible for forcing
-    a full position close.
-    """
+def execute_hedge_leg(state, side_label, original_strike, contract_type, lots, spot_price):
     chain = get_option_chain(state["expiry_date_str"])
     if not chain:
         print(f"[ERROR] Could not fetch option chain for hedge leg ({side_label}).")
@@ -843,6 +909,13 @@ def execute_hedge_leg(state, side_label, original_strike, target_delta_unused,
     hedge_product_id = hedge_ticker["product_id"]
     hedge_symbol = hedge_ticker["symbol"]
     hedge_strike = hedge_ticker.get("strike_price")
+
+    # Trading status check before hedge order too
+    hedge_status = get_product_trading_status(hedge_symbol)
+    if hedge_status != "operational":
+        print(f"[ERROR] Hedge strike {hedge_symbol} is not operational (status: {hedge_status}). "
+              f"Cannot place hedge order.")
+        return False, state
 
     order = place_market_order(hedge_product_id, "buy", lots)
     if not order:
@@ -874,11 +947,6 @@ def execute_hedge_leg(state, side_label, original_strike, target_delta_unused,
 
 
 def force_close_full_position(state, reason):
-    """
-    Emergency full close of ALL legs (original shorts + any active hedge
-    legs), triggered when a hedge order fails. Captures approximate exit
-    marks before closing for the final summary, then resets state.
-    """
     print(f"[FORCE CLOSE] Reason: {reason}. Closing ALL open legs immediately to avoid "
           f"a naked, un-hedged position.")
 
@@ -908,23 +976,20 @@ def force_close_full_position(state, reason):
 
     fresh = default_state()
     fresh["last_entry_date"] = state.get("last_entry_date")
+    fresh["entry_attempts_today"] = state.get("entry_attempts_today", 0)
+    fresh["entry_attempts_date"] = state.get("entry_attempts_date")
+    fresh["last_entry_attempt_ts"] = state.get("last_entry_attempt_ts")
     save_state(fresh)
     return fresh
 
 
 def check_and_trigger_hedge(state, spot_price):
-    """
-    Checks both breakeven levels against current spot price and triggers
-    the one-time hedge on whichever side(s) are breached. On hedge
-    failure, forces a full close of the entire position.
-    Returns the (possibly updated/reset) state.
-    """
     upside = state.get("upside_breakeven")
     downside = state.get("downside_breakeven")
 
     if (not state.get("call_hedge_triggered")) and upside is not None and spot_price > upside:
         success, state = execute_hedge_leg(
-            state, "CALL", state.get("call_strike"), None,
+            state, "CALL", state.get("call_strike"),
             "call_options", abs(state.get("call_lots") or CALL_LOTS), spot_price
         )
         if not success:
@@ -933,11 +998,11 @@ def check_and_trigger_hedge(state, spot_price):
             )
 
     if not state.get("active"):
-        return state  # position may have just been force-closed above
+        return state
 
     if (not state.get("put_hedge_triggered")) and downside is not None and spot_price < downside:
         success, state = execute_hedge_leg(
-            state, "PUT", state.get("put_strike"), None,
+            state, "PUT", state.get("put_strike"),
             "put_options", abs(state.get("put_lots") or PUT_LOTS), spot_price
         )
         if not success:
@@ -953,11 +1018,6 @@ def check_and_trigger_hedge(state, spot_price):
 # ======================================================================
 
 def is_settlement_time_reached(state):
-    """
-    Fixed daily settlement assumption: 17:30 IST. Returns True once the
-    current IST time has passed 17:30 IST on (or after) the trade's
-    expiry date.
-    """
     settlement_h, settlement_m = parse_hhmm(SETTLEMENT_TIME_IST)
     now = now_ist()
     expiry_date_obj = datetime.fromisoformat(state["expiry_date_iso"]).date()
@@ -970,17 +1030,6 @@ def is_settlement_time_reached(state):
 
 
 def print_final_trade_summary(state, natural_settlement=True):
-    """
-    Prints the final P&L summary for the trade, in both dollar amount and
-    percentage (percentage is measured against margin_utilized_at_entry,
-    a fixed baseline captured right after entry).
-
-    For natural settlement: attempts to use realized_pnl from
-    /v2/positions/margined for each leg still tracked. If a leg's
-    realized_pnl is unavailable (e.g., already cleared from the API after
-    settlement), falls back to an estimate using the last known mark price
-    recorded during monitoring.
-    """
     product_ids = []
     for prefix in ("call", "put", "call_hedge", "put_hedge"):
         pid = state.get(f"{prefix}_product_id")
@@ -1047,7 +1096,8 @@ def print_final_trade_summary(state, natural_settlement=True):
     print(f"Max Profit Potential (if no breakout had occurred): "
           f"${state.get('max_profit_potential', 0):.4f}")
     print(f"Margin Utilized At Entry (fixed baseline for %): ${margin_base:.4f}")
-    print(f"TOTAL COMBINED P&L: {'$%.4f' % total_pnl if not any_unavailable else '$%.4f (partial, some legs unavailable)' % total_pnl}")
+    print(f"TOTAL COMBINED P&L: ${total_pnl:.4f}" +
+          (" (partial, some legs unavailable)" if any_unavailable else ""))
     print(f"TOTAL P&L %: {'%.2f%%' % pnl_percent if pnl_percent is not None else 'N/A'}")
     if any_unavailable:
         print("[NOTE] One or more legs' P&L could not be exchange-confirmed via realized_pnl "
@@ -1073,6 +1123,9 @@ def monitor_and_check_exit(state):
 
         fresh = default_state()
         fresh["last_entry_date"] = state.get("last_entry_date")
+        fresh["entry_attempts_today"] = state.get("entry_attempts_today", 0)
+        fresh["entry_attempts_date"] = state.get("entry_attempts_date")
+        fresh["last_entry_attempt_ts"] = state.get("last_entry_attempt_ts")
         save_state(fresh)
         return fresh
 
@@ -1100,9 +1153,15 @@ def monitor_and_check_exit(state):
 
     save_state(state)
 
+    # NEW (v3.1): Loud repeating warning if hedge protection is unavailable for this trade
+    if state.get("upside_breakeven") is None or state.get("downside_breakeven") is None:
+        print("[CRITICAL WARNING] This trade has NO hedge protection (breakeven could not be "
+              "computed at entry - likely zero/negative time value). Position is running FULLY "
+              "NAKED until natural expiry.")
+
     state = check_and_trigger_hedge(state, spot_price)
     if not state.get("active"):
-        return state  # force-closed during hedge check above
+        return state
 
     time_to_expiry = get_time_to_expiry_str(state["expiry_date_iso"])
     upside = state.get("upside_breakeven")
@@ -1145,6 +1204,10 @@ def main():
     print_ip_banner()
 
     state = load_state()
+
+    # NEW (v3.1): Orphan-position startup safety check
+    safe_to_enter = check_for_orphaned_positions(state)
+
     print("[INFO] Strategy started. Monitoring...")
     print(f"[INFO] Base URL: {BASE_URL}")
     print(f"[INFO] Underlying Asset: {UNDERLYING_ASSET}")
@@ -1153,8 +1216,15 @@ def main():
           f"Call Lots: {CALL_LOTS} | Put Lots: {PUT_LOTS}")
     print(f"[INFO] Entry Window: {ENTRY_WINDOW_START} - {ENTRY_WINDOW_END} IST | "
           f"Settlement Assumption: {SETTLEMENT_TIME_IST} IST")
+    print(f"[INFO] Max Entry Attempts/Day: {MAX_ENTRY_ATTEMPTS_PER_WINDOW} | "
+          f"Retry Cooldown: {ENTRY_RETRY_COOLDOWN_SECONDS}s")
     print("[INFO] No SL / Trailing SL / Target in this version. Breakeven hedge (one-time per "
           "side) is the only risk-adjustment mechanism. Positions run to natural expiry.")
+
+    if not safe_to_enter:
+        print("[WARN] Bot will continue running (monitoring only) but WILL NOT attempt new "
+              "entries until the orphaned position warning above is resolved and the bot is "
+              "restarted.")
 
     last_waiting_log_ts = 0
 
@@ -1166,8 +1236,35 @@ def main():
                 state = monitor_and_check_exit(state)
             else:
                 today_iso = now.date().isoformat()
-                if is_within_entry_window(now) and state.get("last_entry_date") != today_iso:
-                    state = attempt_entry(state)
+
+                if state.get("entry_attempts_date") != today_iso:
+                    state["entry_attempts_today"] = 0
+                    state["entry_attempts_date"] = today_iso
+                    state["last_entry_attempt_ts"] = None
+                    save_state(state)
+
+                if (safe_to_enter and is_within_entry_window(now)
+                        and state.get("last_entry_date") != today_iso):
+
+                    if state["entry_attempts_today"] >= MAX_ENTRY_ATTEMPTS_PER_WINDOW:
+                        current_ts = time.time()
+                        if current_ts - last_waiting_log_ts >= WAITING_LOG_INTERVAL_SECONDS:
+                            print(f"[WARN] Max entry attempts ({MAX_ENTRY_ATTEMPTS_PER_WINDOW}) "
+                                  f"reached for today. Will not retry further in this window.")
+                            last_waiting_log_ts = current_ts
+                    else:
+                        last_attempt_ts = state.get("last_entry_attempt_ts")
+                        cooldown_elapsed = (
+                            last_attempt_ts is None
+                            or (time.time() - last_attempt_ts) >= ENTRY_RETRY_COOLDOWN_SECONDS
+                        )
+                        if cooldown_elapsed:
+                            state["entry_attempts_today"] += 1
+                            state["last_entry_attempt_ts"] = time.time()
+                            save_state(state)
+                            print(f"[INFO] Entry attempt {state['entry_attempts_today']}/"
+                                  f"{MAX_ENTRY_ATTEMPTS_PER_WINDOW} for today.")
+                            state = attempt_entry(state)
                 else:
                     current_ts = time.time()
                     if current_ts - last_waiting_log_ts >= WAITING_LOG_INTERVAL_SECONDS:
