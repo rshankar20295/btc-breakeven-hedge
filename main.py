@@ -1,8 +1,8 @@
 """
-Delta Exchange - BTC Options Short Strangle Strategy (v3.4 - Live Monitor P&L + Expiry Display Fix)
+Delta Exchange - BTC Options Short Strangle Strategy (v3.5 - Crossed-Strike Safety Fix)
 ========================================================================================
 This is a NEW, SEPARATE version. It does NOT modify or replace main.py (v1), the v2
-SL/Target/Trailing-SL script, or v3/v3.1/v3.2/v3.3 - deploy this as its own repo/service.
+SL/Target/Trailing-SL script, or v3/v3.1/v3.2/v3.3/v3.4 - deploy this as its own repo/service.
 
 Sells 1 Call + 1 Put on BTC options, strike selected by nearest-match delta (any
 delta, including deep ITM values like 0.7 / -0.7). Entry within a user-defined
@@ -10,32 +10,42 @@ IST time window. NO stop loss, trailing stop loss, or target exit exists in this
 version - positions are intended to run to natural expiry/settlement on the
 exchange.
 
-WHAT CHANGED IN v3.4 (on top of v3.3):
-  1. TIME-TO-EXPIRY DISPLAY FIX: Previously, the displayed "Time to Expiry"
-     countdown in [MONITOR] and [ENTRY SUMMARY] logs used a HARDCODED
-     21:30 IST as the assumed expiry moment, while the actual settlement
-     detection logic (is_settlement_time_reached) uses SETTLEMENT_TIME_IST
-     (17:30 IST). This caused the displayed countdown to disagree with
-     actual bot behavior by up to 4 hours (e.g. showing "0d 4h 0m"
-     immediately before the settlement-reached message fired). FIXED by
-     making combine_expiry() use SETTLEMENT_TIME_IST directly, so the
-     display always matches the real trigger time.
-  2. LIVE MONITOR P&L: Previously, [MONITOR] log lines only showed Spot
-     price and breakeven levels - no P&L was shown until the trade ended
-     (at natural settlement or force-close). Added
-     calculate_live_pnl_estimate(), which computes an ESTIMATED running
-     P&L (in $ and %) from last-known mark prices on every monitoring
-     tick and includes it in the [MONITOR] line. This is explicitly an
-     ESTIMATE (not exchange-confirmed realized P&L), same caveat as the
-     final trade summary.
+WHAT CHANGED IN v3.5 (on top of v3.4):
+  1. CROSSED-STRIKE SAFETY FIX: Previously, when both CALL_TARGET_DELTA and
+     PUT_TARGET_DELTA were set to deep, symmetric ITM values (e.g. 0.7 /
+     -0.7), strike selection could produce a CALL strike LOWER than the
+     PUT strike (e.g. Call 71000 / Put 73400 with spot at ~71968). This
+     "crossed strike" condition inverts the normal breakeven ordering:
+     Upside BE (Call Strike + time value/unit) ends up LOWER than
+     Downside BE (Put Strike - time value/unit), meaning there is NO safe
+     zone between them. Any spot price in that inverted range makes BOTH
+     hedge trigger conditions (spot > upside_BE and spot < downside_BE)
+     true SIMULTANEOUSLY - which caused BOTH the call hedge and put hedge
+     to fire within seconds of entry, even with no real adverse price
+     move (CONFIRMED via live testnet log: entry spot 71968.2, hedges for
+     both sides fired at spot 71850.1 moments later). FIXED by adding an
+     explicit check after breakeven calculation: if downside_breakeven >=
+     upside_breakeven, the strikes are crossed and hedge protection is
+     DISABLED for that entire trade (same fallback behavior as the
+     existing zero/negative time value case) instead of silently firing
+     false hedges. A specific [CRITICAL WARNING] explains this exact
+     condition so it's not confused with the time-value warning.
+
+CARRIED OVER FROM v3.4:
+  1. TIME-TO-EXPIRY DISPLAY FIX: combine_expiry() uses SETTLEMENT_TIME_IST
+     (17:30 IST) instead of a hardcoded 21:30, so the displayed countdown
+     matches actual settlement detection behavior.
+  2. LIVE MONITOR P&L: calculate_live_pnl_estimate() computes an
+     ESTIMATED running P&L (in $ and %) from last-known mark prices on
+     every monitoring tick and includes it in the [MONITOR] line.
 
 CARRIED OVER FROM v3.3 (CRITICAL FIXES):
   1. SIGNATURE MISMATCH FIX: query string built ONCE using
      urllib.parse.urlencode and reused verbatim for both signing and the
-     actual request URL (fixes multi-value query param signature errors).
+     actual request URL.
   2. SPOT PRICE FETCH FIX: get_underlying_spot_price() reads "spot_price"
      from the perpetual futures ticker (e.g. "BTCUSD") instead of the
-     ".DEXBTUSD" index symbol (which returned no usable data).
+     ".DEXBTUSD" index symbol.
 
 CARRIED OVER FROM v3.2:
   - ENTRY DELTA FALLBACK and HEDGE STRIKE FALLBACK logic.
@@ -60,6 +70,12 @@ IMPORTANT WARNINGS (READ CAREFULLY):
   - A market in disrupted_cancel_only mode CANNOT be traded at any price -
     this is an exchange-enforced state. The fallback logic works by trying
     OTHER strikes, not by forcing an order through on a halted contract.
+  - USING DEEP, SYMMETRIC ITM DELTAS ON BOTH LEGS (e.g. CALL_TARGET_DELTA
+    0.7+ AND PUT_TARGET_DELTA -0.7+) CAN STILL PRODUCE A CROSSED-STRIKE
+    TRADE WHERE HEDGE PROTECTION IS AUTOMATICALLY DISABLED (see v3.5 fix
+    above). If you want working hedge protection, prefer OTM or
+    near-ATM delta targets (e.g. 0.3 to 0.5 magnitude) that keep Call
+    Strike above Put Strike.
   - Test on TESTNET first (set DELTA_BASE_URL env var to testnet URL).
   - All configuration is via environment variables (set in Railway dashboard).
   - Railway's default networking may assign a DIFFERENT outbound IP on every
@@ -158,12 +174,9 @@ def format_timedelta(td):
 
 def combine_expiry(expiry_date_obj):
     """
-    FIXED (v3.4): Display-only expiry moment for 'Time to Expiry' logs.
-    Previously hardcoded to 21:30 IST, which DISAGREED with the actual
-    settlement detection logic (is_settlement_time_reached), which uses
-    SETTLEMENT_TIME_IST (17:30 IST). Now uses SETTLEMENT_TIME_IST directly
-    so the displayed countdown always matches when the bot will actually
-    treat the trade as settled.
+    Display-only expiry moment for 'Time to Expiry' logs. Uses
+    SETTLEMENT_TIME_IST directly so the displayed countdown always
+    matches when the bot will actually treat the trade as settled.
     """
     settlement_h, settlement_m = parse_hhmm(SETTLEMENT_TIME_IST)
     return datetime(
@@ -248,7 +261,7 @@ def send_request(method, path, query_params=None, body=None):
         "api-key": API_KEY,
         "timestamp": timestamp,
         "signature": signature,
-        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.4",
+        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.5",
         "Content-Type": "application/json",
     }
 
@@ -722,7 +735,7 @@ def calculate_breakeven_levels(call_strike, put_strike, total_time_value,
 
 
 # ======================================================================
-# LIVE (ESTIMATED, IN-TRADE) P&L CALCULATION - NEW IN v3.4
+# LIVE (ESTIMATED, IN-TRADE) P&L CALCULATION
 # ======================================================================
 
 def calculate_live_pnl_estimate(state):
@@ -880,15 +893,52 @@ def attempt_entry(state):
         call_strike_f, put_strike_f, total_time_value, call_contract_value, call_size
     )
 
+    # NEW IN v3.5: CROSSED-STRIKE SAFETY CHECK.
+    # If both legs are targeted at deep, symmetric ITM deltas, strike
+    # selection can produce Call Strike < Put Strike (the "crossed"
+    # condition). In that case, Upside BE (Call Strike + time value/unit)
+    # can end up LOWER than Downside BE (Put Strike - time value/unit),
+    # meaning there is NO safe zone between them - any spot price in that
+    # inverted range would make BOTH hedge conditions true simultaneously,
+    # even without any real adverse price move. Detect this and disable
+    # hedge protection for the trade instead of allowing false/instant
+    # hedges to fire on both sides.
+    strikes_crossed = False
+    if (upside_breakeven is not None and downside_breakeven is not None
+            and downside_breakeven >= upside_breakeven):
+        strikes_crossed = True
+        print("#" * 70)
+        print("#  [CRITICAL WARNING] CROSSED STRIKES DETECTED - HEDGE LOGIC")
+        print("#  DISABLED FOR THIS TRADE.")
+        print(f"#  Call Strike ({call_strike_f}) is not above Put Strike "
+              f"({put_strike_f}).")
+        print("#  This can happen when both legs are targeted at deep,")
+        print("#  symmetric ITM deltas (e.g. CALL_TARGET_DELTA=0.7 and")
+        print("#  PUT_TARGET_DELTA=-0.7).")
+        print(f"#  Computed Upside BE ({upside_breakeven:.4f}) <= Downside BE "
+              f"({downside_breakeven:.4f}) - there is NO safe zone between")
+        print("#  them, which would cause BOTH hedge conditions to be true")
+        print("#  simultaneously even without any adverse price move. To")
+        print("#  avoid firing a false/instant hedge on both sides, hedge")
+        print("#  protection is DISABLED for this entire trade. The position")
+        print("#  will run FULLY NAKED AND UNPROTECTED until natural expiry.")
+        print("#  Consider using less extreme/less symmetric delta targets")
+        print("#  (e.g. CALL_TARGET_DELTA=0.3, PUT_TARGET_DELTA=-0.3) to")
+        print("#  avoid this condition in future entries.")
+        print("#" * 70)
+        upside_breakeven = None
+        downside_breakeven = None
+
     if total_time_value <= 0 or upside_breakeven is None or downside_breakeven is None:
-        print("#" * 70)
-        print("#  [CRITICAL WARNING] TIME VALUE IS ZERO/NEGATIVE OR BREAKEVEN")
-        print("#  COULD NOT BE COMPUTED. HEDGE PROTECTION WILL BE UNAVAILABLE")
-        print("#  FOR THIS ENTIRE TRADE. This commonly happens with deep ITM")
-        print("#  strikes near expiry. The position will run FULLY NAKED AND")
-        print("#  UNPROTECTED until natural expiry. Proceeding per configured")
-        print("#  delta settings, but consider reviewing your delta targets.")
-        print("#" * 70)
+        if not strikes_crossed:
+            print("#" * 70)
+            print("#  [CRITICAL WARNING] TIME VALUE IS ZERO/NEGATIVE OR BREAKEVEN")
+            print("#  COULD NOT BE COMPUTED. HEDGE PROTECTION WILL BE UNAVAILABLE")
+            print("#  FOR THIS ENTIRE TRADE. This commonly happens with deep ITM")
+            print("#  strikes near expiry. The position will run FULLY NAKED AND")
+            print("#  UNPROTECTED until natural expiry. Proceeding per configured")
+            print("#  delta settings, but consider reviewing your delta targets.")
+            print("#" * 70)
 
     margin_data = get_margin_and_pnl_for_products([call_product_id, put_product_id])
     margin_utilized_at_entry = 0.0
@@ -1241,8 +1291,8 @@ def monitor_and_check_exit(state):
 
     if state.get("upside_breakeven") is None or state.get("downside_breakeven") is None:
         print("[CRITICAL WARNING] This trade has NO hedge protection (breakeven could not be "
-              "computed at entry - likely zero/negative time value). Position is running FULLY "
-              "NAKED until natural expiry.")
+              "computed at entry - likely zero/negative time value, or crossed strikes from "
+              "deep symmetric ITM deltas). Position is running FULLY NAKED until natural expiry.")
 
     state = check_and_trigger_hedge(state, spot_price)
     if not state.get("active"):
@@ -1252,7 +1302,6 @@ def monitor_and_check_exit(state):
     upside = state.get("upside_breakeven")
     downside = state.get("downside_breakeven")
 
-    # NEW IN v3.4: live estimated P&L for the [MONITOR] line
     live_pnl, live_pnl_pct, pnl_unavailable = calculate_live_pnl_estimate(state)
     if pnl_unavailable:
         pnl_str = "N/A (some legs unavailable)"
@@ -1315,6 +1364,11 @@ def main():
           f"Max Hedge Strike Fallback Attempts: {MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS}")
     print("[INFO] No SL / Trailing SL / Target in this version. Breakeven hedge (one-time per "
           "side) is the only risk-adjustment mechanism. Positions run to natural expiry.")
+    if abs(CALL_TARGET_DELTA) >= 0.6 and abs(PUT_TARGET_DELTA) >= 0.6:
+        print("[WARN] Both CALL_TARGET_DELTA and PUT_TARGET_DELTA are deep ITM (>= 0.6 "
+              "magnitude). This CAN produce a crossed-strike trade (Call Strike < Put "
+              "Strike) where hedge protection is automatically disabled at entry (see "
+              "v3.5 changelog). Consider less extreme deltas if hedge protection is required.")
 
     if not safe_to_enter:
         print("[WARN] Bot will continue running (monitoring only) but WILL NOT attempt new "
