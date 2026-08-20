@@ -1,8 +1,8 @@
 """
-Delta Exchange - BTC Options Short Strangle Strategy (v3.3 - Breakeven Hedge Edition)
+Delta Exchange - BTC Options Short Strangle Strategy (v3.4 - Live Monitor P&L + Expiry Display Fix)
 ========================================================================================
 This is a NEW, SEPARATE version. It does NOT modify or replace main.py (v1), the v2
-SL/Target/Trailing-SL script, or v3/v3.1/v3.2 - deploy this as its own repo/service.
+SL/Target/Trailing-SL script, or v3/v3.1/v3.2/v3.3 - deploy this as its own repo/service.
 
 Sells 1 Call + 1 Put on BTC options, strike selected by nearest-match delta (any
 delta, including deep ITM values like 0.7 / -0.7). Entry within a user-defined
@@ -10,50 +10,39 @@ IST time window. NO stop loss, trailing stop loss, or target exit exists in this
 version - positions are intended to run to natural expiry/settlement on the
 exchange.
 
-WHAT CHANGED IN v3.3 (CRITICAL FIXES on top of v3.2):
-  1. SIGNATURE MISMATCH FIX: Previously, the query string used to COMPUTE
-     the request signature was built manually (e.g. "product_ids=1,2"),
-     but the actual HTTP request sent via requests' params= argument got
-     auto-encoded by the requests library (commas became %2C). This meant
-     the signed string and the actually-transmitted string DIFFERED,
-     causing Delta's server to reject the request with "Signature
-     Mismatch" - this ONLY affected endpoints called with multi-value
-     query params (e.g. get_margin_and_pnl_for_products), not simple
-     single-value params used elsewhere. FIXED by building the query
-     string ONCE with urllib.parse.urlencode and using that EXACT SAME
-     encoded string both for signing and for the actual request URL
-     (never letting requests re-encode it separately).
-  2. SPOT PRICE FETCH FIX: Previously, get_underlying_spot_price() queried
-     the ".DEXBTUSD" index symbol via /v2/tickers/{symbol}, which was
-     VERIFIED to return {"success": true, "result": null} - i.e. no usable
-     data at all. This caused monitoring (and therefore ALL breakeven
-     hedge-breach detection) to silently fail every single cycle. FIXED
-     by switching to the perpetual futures ticker (e.g. "BTCUSD") and
-     reading its "spot_price" field instead, which was verified to return
-     valid data.
+WHAT CHANGED IN v3.4 (on top of v3.3):
+  1. TIME-TO-EXPIRY DISPLAY FIX: Previously, the displayed "Time to Expiry"
+     countdown in [MONITOR] and [ENTRY SUMMARY] logs used a HARDCODED
+     21:30 IST as the assumed expiry moment, while the actual settlement
+     detection logic (is_settlement_time_reached) uses SETTLEMENT_TIME_IST
+     (17:30 IST). This caused the displayed countdown to disagree with
+     actual bot behavior by up to 4 hours (e.g. showing "0d 4h 0m"
+     immediately before the settlement-reached message fired). FIXED by
+     making combine_expiry() use SETTLEMENT_TIME_IST directly, so the
+     display always matches the real trigger time.
+  2. LIVE MONITOR P&L: Previously, [MONITOR] log lines only showed Spot
+     price and breakeven levels - no P&L was shown until the trade ended
+     (at natural settlement or force-close). Added
+     calculate_live_pnl_estimate(), which computes an ESTIMATED running
+     P&L (in $ and %) from last-known mark prices on every monitoring
+     tick and includes it in the [MONITOR] line. This is explicitly an
+     ESTIMATE (not exchange-confirmed realized P&L), same caveat as the
+     final trade summary.
 
-  BOTH BUGS ABOVE WERE CONFIRMED VIA LIVE TESTING AGAINST THE EXCHANGE.
-  Bug #2 in particular is CRITICAL - it means any bot instance running
-  v3/v3.1/v3.2 has had ZERO hedge protection capability since the spot
-  price could never be fetched. If you have an active trade running on an
-  earlier version, redeploy this fix immediately and manually monitor
-  price against your logged breakeven levels until the fix is confirmed
-  live (watch for "[MONITOR] Spot: ..." lines resuming in the logs).
+CARRIED OVER FROM v3.3 (CRITICAL FIXES):
+  1. SIGNATURE MISMATCH FIX: query string built ONCE using
+     urllib.parse.urlencode and reused verbatim for both signing and the
+     actual request URL (fixes multi-value query param signature errors).
+  2. SPOT PRICE FETCH FIX: get_underlying_spot_price() reads "spot_price"
+     from the perpetual futures ticker (e.g. "BTCUSD") instead of the
+     ".DEXBTUSD" index symbol (which returned no usable data).
 
 CARRIED OVER FROM v3.2:
-  - ENTRY DELTA FALLBACK: tries next-nearest delta match if top choice is
-    a disrupted/non-operational strike (up to MAX_ENTRY_STRIKE_FALLBACK_ATTEMPTS).
-  - HEDGE STRIKE FALLBACK: tries progressively further strikes toward spot
-    if the ideal ATM hedge strike is disrupted (up to
-    MAX_HEDGE_STRIKE_FALLBACK_ATTEMPTS), always avoiding the original sold
-    strike to prevent netting/closing the existing short.
+  - ENTRY DELTA FALLBACK and HEDGE STRIKE FALLBACK logic.
 
 CARRIED OVER FROM v3.1:
-  - TRADING STATUS PRE-CHECK on both legs before every order attempt.
-  - ENTRY RETRY CAP + COOLDOWN instead of retrying every poll cycle.
-  - LOT SIZE VALIDATION: bot refuses to start if CALL_LOTS != PUT_LOTS.
-  - ZERO/NEGATIVE TIME VALUE WARNING if breakeven could not be computed.
-  - ORPHAN POSITION STARTUP CHECK.
+  - TRADING STATUS PRE-CHECK, ENTRY RETRY CAP + COOLDOWN, LOT SIZE
+    VALIDATION, ZERO/NEGATIVE TIME VALUE WARNING, ORPHAN POSITION CHECK.
 
 CARRIED OVER FROM v3 (core strategy, unchanged):
   - Breakeven computed from TIME VALUE (real max profit), not raw premium.
@@ -80,6 +69,9 @@ IMPORTANT WARNINGS (READ CAREFULLY):
     explicitly confirmed by the user, not a documented exchange guarantee.
     Cross-check final P&L against your actual Delta Exchange fills/positions
     history, especially during initial testing.
+  - The live [MONITOR] P&L is an ESTIMATE based on last-known mark prices,
+    NOT exchange-confirmed realized P&L. Use it as a directional indicator
+    only, not for precise accounting.
 """
 
 import hashlib
@@ -165,10 +157,18 @@ def format_timedelta(td):
 
 
 def combine_expiry(expiry_date_obj):
-    """Display-only approximate expiry moment for 'Time to Expiry' logs."""
+    """
+    FIXED (v3.4): Display-only expiry moment for 'Time to Expiry' logs.
+    Previously hardcoded to 21:30 IST, which DISAGREED with the actual
+    settlement detection logic (is_settlement_time_reached), which uses
+    SETTLEMENT_TIME_IST (17:30 IST). Now uses SETTLEMENT_TIME_IST directly
+    so the displayed countdown always matches when the bot will actually
+    treat the trade as settled.
+    """
+    settlement_h, settlement_m = parse_hhmm(SETTLEMENT_TIME_IST)
     return datetime(
         expiry_date_obj.year, expiry_date_obj.month, expiry_date_obj.day,
-        21, 30, 0, tzinfo=IST
+        settlement_h, settlement_m, 0, tzinfo=IST
     )
 
 
@@ -229,15 +229,10 @@ def generate_signature(secret, message):
 
 def send_request(method, path, query_params=None, body=None):
     """
-    FIXED (v3.3): Query string is now built ONCE using urllib.parse.urlencode
-    and that EXACT SAME encoded string is used both for computing the
-    signature AND for the actual request URL. Previously, the signature
-    was computed on a manually-built, unencoded string (e.g. commas left
-    as-is), while the requests library separately re-encoded the same
-    params when building the real request (e.g. commas -> %2C), causing
-    the signed string and transmitted string to differ - resulting in a
-    "Signature Mismatch" error from Delta's server on any multi-value
-    query parameter (e.g. product_ids=1,2).
+    Query string is built ONCE using urllib.parse.urlencode and that
+    EXACT SAME encoded string is used both for computing the signature
+    AND for the actual request URL (fixes multi-value query param
+    signature mismatches).
     """
     timestamp = str(int(time.time()))
     query_string = ""
@@ -253,7 +248,7 @@ def send_request(method, path, query_params=None, body=None):
         "api-key": API_KEY,
         "timestamp": timestamp,
         "signature": signature,
-        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.3",
+        "User-Agent": "btc-strangle-breakeven-hedge-bot-v3.4",
         "Content-Type": "application/json",
     }
 
@@ -534,11 +529,8 @@ def get_mark_price(product_id, symbol):
 
 def get_underlying_spot_price():
     """
-    FIXED (v3.3): Previously queried the ".DE{ASSET}USD" index symbol via
-    /v2/tickers/{symbol}, which was VERIFIED (via live testing) to return
-    {"success": true, "result": null} - no usable data. Now queries the
-    perpetual futures ticker (e.g. "BTCUSD") instead and reads its
-    "spot_price" field, which was verified to return valid data.
+    Queries the perpetual futures ticker (e.g. "BTCUSD") and reads its
+    "spot_price" field.
     """
     perp_symbol = f"{UNDERLYING_ASSET.upper()}USD"
 
@@ -727,6 +719,57 @@ def calculate_breakeven_levels(call_strike, put_strike, total_time_value,
         return upside, downside
     except (TypeError, ValueError, ZeroDivisionError):
         return None, None
+
+
+# ======================================================================
+# LIVE (ESTIMATED, IN-TRADE) P&L CALCULATION - NEW IN v3.4
+# ======================================================================
+
+def calculate_live_pnl_estimate(state):
+    """
+    Computes an ESTIMATED running P&L for the currently open trade, using
+    last-known mark prices (state[f"{prefix}_last_mark"]), NOT exchange
+    realized P&L (since the trade is still open). Used only for the
+    periodic [MONITOR] log line. Returns (total_pnl, pnl_percent,
+    any_leg_unavailable).
+    """
+    def leg_pnl(prefix, is_short):
+        entry_price = state.get(f"{prefix}_entry_price")
+        last_mark = state.get(f"{prefix}_last_mark")
+        lots = state.get(f"{prefix}_lots")
+        cv = state.get(f"{prefix}_contract_value") or state.get("call_contract_value") or 0
+
+        if entry_price is None or last_mark is None or lots is None:
+            return None
+
+        if is_short:
+            return (entry_price - last_mark) * cv * abs(lots)
+        else:
+            return (last_mark - entry_price) * cv * abs(lots)
+
+    call_pnl = leg_pnl("call", is_short=True)
+    put_pnl = leg_pnl("put", is_short=True)
+
+    call_hedge_pnl = None
+    if state.get("call_hedge_triggered"):
+        call_hedge_pnl = leg_pnl("call_hedge", is_short=False)
+
+    put_hedge_pnl = None
+    if state.get("put_hedge_triggered"):
+        put_hedge_pnl = leg_pnl("put_hedge", is_short=False)
+
+    total_pnl = 0.0
+    any_unavailable = False
+    for pnl in (call_pnl, put_pnl, call_hedge_pnl, put_hedge_pnl):
+        if pnl is None:
+            any_unavailable = True
+        else:
+            total_pnl += pnl
+
+    margin_base = state.get("margin_utilized_at_entry") or 0
+    pnl_percent = (total_pnl / margin_base * 100.0) if margin_base else None
+
+    return total_pnl, pnl_percent, any_unavailable
 
 
 # ======================================================================
@@ -1209,12 +1252,21 @@ def monitor_and_check_exit(state):
     upside = state.get("upside_breakeven")
     downside = state.get("downside_breakeven")
 
+    # NEW IN v3.4: live estimated P&L for the [MONITOR] line
+    live_pnl, live_pnl_pct, pnl_unavailable = calculate_live_pnl_estimate(state)
+    if pnl_unavailable:
+        pnl_str = "N/A (some legs unavailable)"
+    else:
+        pct_str = ("%.2f%%" % live_pnl_pct) if live_pnl_pct is not None else "N/A"
+        pnl_str = f"${live_pnl:.4f} ({pct_str}) [estimated, not exchange-confirmed]"
+
     print(f"[MONITOR] Spot: {spot_price} | Upside BE: "
           f"{'%.4f' % upside if upside is not None else 'N/A'} "
           f"({'BREACHED-HEDGED' if state.get('call_hedge_triggered') else 'watching'}) | "
           f"Downside BE: {'%.4f' % downside if downside is not None else 'N/A'} "
           f"({'BREACHED-HEDGED' if state.get('put_hedge_triggered') else 'watching'}) | "
-          f"Time to Expiry: {time_to_expiry} | Status: HOLDING TO NATURAL EXPIRY")
+          f"Time to Expiry: {time_to_expiry} | Live P&L: {pnl_str} | "
+          f"Status: HOLDING TO NATURAL EXPIRY")
 
     return state
 
